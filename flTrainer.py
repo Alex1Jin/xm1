@@ -152,6 +152,7 @@ def test_model(model, data_loader, device, print_perform=False):
     for step, (batch_x, batch_y) in enumerate(data_loader):
         batch_x, batch_y = batch_x.to(device), batch_y.to(device)
         batch_y_predict = model(batch_x)
+
         batch_y_predict = torch.argmax(batch_y_predict, dim=1)
         y_predict.append(batch_y_predict)
         y_true.append(batch_y)
@@ -247,7 +248,12 @@ class FederatedLearningTrainer(ParameterContainer):
 
         train_data, test_data = load_init_data(dataname=self.dataname, datadir=self.datadir)
         xmam_data = copy.deepcopy(train_data)
-
+        if self.defense_method == 'fltrust':
+            server=copy.deepcopy(self.net_avg)
+            indices=[i for i in range(49900,50000)]
+            server_data=create_train_data_loader(self.dataname, train_data, self.trigger_label,
+                                                             self.poisoned_portion, self.batch_size, indices,
+                                                             malicious=False)
         ################################################################ distribute data to clients before training
         if self.backdoor_type == 'semantic':
             dataidxs = self.net_dataidx_map[9999]
@@ -378,7 +384,15 @@ class FederatedLearningTrainer(ParameterContainer):
                 norm_diff = torch.norm(vec_updated_client_model - vec_global_model_pre)
                 logger.info("the norm difference between global model pre and the updated benign client model: {}".format(norm_diff))
                 norm_diff_collector.append(norm_diff.item())
+            if self.defense_method == 'fltrust':
+                for e in range(1, self.local_training_epoch + 1):
+                    optimizer = optim.SGD(server.parameters(), lr=self.args_lr * self.args_gamma ** (flr - 1),
+                                          momentum=0.9,
+                                          weight_decay=1e-4)  # epoch, net, train_loader, optimizer, criterion
+                    for param_group in optimizer.param_groups:
+                        logger.info("Effective lr in fl round: {} is {}".format(flr, param_group['lr']))
 
+                    train(server, server_data, self.device, self.criterion, optimizer)
 
             ########################################################################################## attack process
             if self.untargeted_type == 'krum-attack':
@@ -471,10 +485,16 @@ class FederatedLearningTrainer(ParameterContainer):
                 chosens = 'none'
                 self.defender = RLR()
                 self.net_avg = self.defender.exec(global_model_pre=self.net_avg,net_list=net_list,device=self.device)
-            elif sefl.defense_method == 'fltrust':
+            elif self.defense_method == 'fltrust':
                 chosens = 'none'
                 self.defender = fltrust()
-                self.net_avg = self.defender.exec()
+                self.net_avg = self.defender.exec(global_model_pre=self.net_avg, net_list=net_list, server_net=server,
+                                                  device=self.device)
+            elif self.defense_method == 'flame':
+                chosens = 'none'
+                self.defender = flame()
+                self.net_avg = self.defender.exec(global_model_pre=self.net_avg, client_model=net_list, device=self.device)
+
             else:
                 # NotImplementedError("Unsupported defense method !")
                 pass
@@ -553,6 +573,38 @@ class FederatedLearningTrainer(ParameterContainer):
             backdoor_task_acc.append(backdoor_acc)
             client_chosen.append(chosens)
 
+        logger.info("Measuring the accuracy of  all models")
+        overall_acc = 0
+
+        out = []
+        net_list=self.model_list
+        for i in range(len(net_list)):
+            out.append(test_model(net_list[i], self.test_data_ori_loader, self.device, print_perform=False))
+        # test_model(self.net_avg, self.test_data_ori_loader, self.device, print_perform=False)
+
+        # np.mean(out)
+        for i in range(len(net_list)):
+            # print(out[i])
+            overall_acc += out[i]
+        overall_acc /= len(net_list)
+
+        out = []
+        logger.info("=====Main task test accuracy=====: {}".format(overall_acc))
+        for i in range(len(net_list)):
+            out.append(test_model(net_list[i], self.test_data_backdoor_loader, self.device, print_perform=False))
+        backdoor_acc = 0
+        mn = 0
+        for i in range(len(net_list)):
+            # print(out[i])
+            backdoor_acc += out[i]
+            global_user_idx = i
+            if global_user_idx < self.malicious_ratio * self.num_nets:
+                backdoor_acc -= out[i]
+                mn += 1
+
+        backdoor_acc /= len(net_list) - mn
+
+        logger.info("=====Backdoor task test accuracy=====: {}".format(backdoor_acc))
 
         #################################################################################### save result to .csv
         df = pd.DataFrame({'fl_iter': fl_iter_list,
