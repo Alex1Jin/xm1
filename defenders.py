@@ -12,7 +12,8 @@ import time
 
 def vectorize_net(net):
     return torch.cat([p.view(-1) for p in net.parameters()])
-
+def vectorize_net_grad(net):
+    return torch.cat([p.grad.view(-1,1) for p in net.parameters()])
 
 def load_model_weight(net, weight):
     index_bias = 0
@@ -381,31 +382,6 @@ class RFA(Defense):
         return sum([alpha * self.l2dist(median, p) for alpha, p in zip(alphas, points)])
 
 
-
-class fltrust(Defense):
-    def __init__(self, *args, **kwargs):
-        pass
-
-    def exec(self,global_model_pre,net_list, server_update,device,*args, **kwargs):
-        net_avg=copy.deepcopy(global_model_pre)
-        whole_aggregator = []
-        param_list=[]
-        cos_sim = []
-        new_param = []
-        for each_param in param_list:
-            each_param_array = each_param.squeeze()
-            cos_sim.append(torch.dot(baseline, each_param_array) / (torch.norm(baseline) + 1e-9) / (torch.norm(each_param_array) + 1e-9))
-        cos_sim = torch.stack(*cos_sim)[:-1]
-        cos_sim = torch.maximum(cos_sim, 0)
-        normalized_weights = cos_sim / (torch.sum(cos_sim) + 1e-9)  # weighted trust score
-        for i in range(n):
-            new_param.append(param_list[i] * normalized_weights[i] / (nd.norm(param_list[i]) + 1e-9) * nd.norm(baseline))
-        global_update = torch.sum(torch.concat(*new_param_list, dim=1), axis=-1)
-        for param_index, p in enumerate(net_avg.parameters()):
-            p.data = list(global_model_pre.parameters())[param_index].data + whole_aggregator[param_index]
-
-        return net_avg
-
 class RLR(Defense):
     def __init__(self, *args, **kwargs):
         pass
@@ -455,5 +431,105 @@ class RLR(Defense):
 
         for param_index, p in enumerate(net_avg.parameters()):
             p.data = list(global_model_pre.parameters())[param_index].data + whole_aggregator[param_index].to(device)
+
+        return net_avg
+
+class fltrust(Defense):
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def exec(self,global_model_pre,net_list, server_net,device,*args, **kwargs):
+        net_avg=copy.deepcopy(global_model_pre)
+        param_list=[]
+        cos_sim = []
+        new_param = []
+        n=len(net_list)
+
+        for net_index, net  in enumerate(net_list):
+            # data=[]
+            x=vectorize_net_grad(net).cpu().numpy()
+            # for param_index, p in enumerate(net.parameters()):
+            #     data.append(list(net.parameters())[param_index].grad)
+            # data = torch.cat([torch.reshape(x, ((-1, 1))) for x in data], dim=0).cpu().numpy()
+            # print(len(x))
+            param_list.append(copy.deepcopy(x))
+        # data=[]
+        # for param_index, p in enumerate(server_net.parameters()):
+        #     data.append(list(server_net.parameters())[param_index].grad)
+        #
+        # data = torch.cat([torch.reshape(x,((-1,1))) for x in data],dim=0).cpu().numpy()
+        param_list.append(copy.deepcopy(vectorize_net_grad(server_net).cpu().numpy()))
+
+        baseline=param_list[-1].squeeze()
+        for each_param in param_list:
+
+            each_param_array = each_param.squeeze()
+            x1=np.dot(baseline, each_param_array)
+            x2=np.linalg.norm(baseline,2) + 1e-9
+            x3=np.linalg.norm(each_param_array,2)+1e-9
+            cos_sim.append(x1/x2/x3)
+
+        cos_sim = np.stack(cos_sim)[:-1]
+        cos_sim = np.maximum(cos_sim, 0)
+        normalized_weights = cos_sim / (np.sum(cos_sim) + 1e-9)  # weighted trust score
+
+        for i in range(n):
+            new_param.append(param_list[i] * normalized_weights[i] / (np.linalg.norm(param_list[i]) + 1e-9) * np.linalg.norm(baseline))
+        # new_param = np.array(new_param)
+        p=np.concatenate(new_param, axis=1)
+        global_update = np.sum(p, axis=-1)
+        idx = 0
+
+        for param_index, p in enumerate(net_avg.parameters()):
+            p_data= list(net_avg.parameters())[param_index].data
+            shape=len(p_data.reshape((-1,1)))
+            x= torch.Tensor(0.1 * global_update[idx:(idx +shape )].reshape(p_data.shape)).cuda(device)
+            p.data = p_data - x
+            idx+=shape
+        return net_avg
+
+class flame(Defense):
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def exec(self, global_model_pre,client_model, device,*args, **kwargs):
+        net_avg = global_model_pre
+        epsilon=3725
+        delta=1
+        cos=[]
+
+        for i in range(len(client_model)):
+            for j in range(i,len(client_model)):
+                x1=vectorize_net(client_model[i])
+                x2=vectorize_net(client_model[j])
+
+                # cos.append(torch.cosine_similarity(torch.tensor([item.cpu().detach().numpy() for item in x1]).cuda(), torch.tensor([item.cpu().detach().numpy() for item in x2]).cuda(), dim=1))
+                cos.append(torch.cosine_similarity((x1),(x2),dim=0).detach().cpu())
+        # cos = np.ndarray(cos)
+        cos = torch.cat([p.view(-1) for p in cos]).reshape(-1,1)
+
+        pca = PCA(n_components=3)
+        X_new = pca.fit_transform(cos)
+        # X_new = pca.fit_transform(net_vec)
+        clusterer = hdbscan.HDBSCAN(min_cluster_size=2)
+        cluster_labels = clusterer.fit_predict(X_new)
+        majority = Counter(cluster_labels)
+        majority = majority.most_common()[0][0]
+        out=majority
+        e = []
+        for i in range(len(client_model)):
+            e.append(F.pairwise_distance(net_avg,client_model[i]))
+        st=torch.median(torch.Tensor(e))
+        whole_aggregator = []
+        for p_index, p in enumerate(client_model[0].parameters()):
+            # initial
+            params_aggregator = torch.zeros(p.size()).to(device)
+            for i in range(len(out)):
+                net=client_model[out[i]]
+                params_aggregator = params_aggregator + 1 / len(out) * list(net.parameters())[p_index].data*min(1,st/e[out[i]])
+            whole_aggregator.append(params_aggregator)
+        sigma= st*1/epsilon*sqrt(2*log(1.25/delta))
+        for param_index, p in enumerate(net_avg.parameters()):
+            p.data = whole_aggregator[param_index]+np.random.rand(len(whole_aggregator[param_index]))*sigma
 
         return net_avg
