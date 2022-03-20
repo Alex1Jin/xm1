@@ -80,7 +80,7 @@ if __name__ == "__main__":
     if args.model == "lenet":
         if args.load_premodel==True:
             net_avg = LeNet().to(device)
-            with open("savedModel/mnist_lenet_backdoored.pt", "rb") as ckpt_file:
+            with open("savedModel/mnist_lenet.pt", "rb") as ckpt_file:
                 ckpt_state_dict = torch.load(ckpt_file, map_location=device)
             net_avg.load_state_dict(ckpt_state_dict)
             logger.info("Loading pre-model successfully ...")
